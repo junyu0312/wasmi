@@ -8,21 +8,15 @@ use crate::{
     memory_units::Pages,
     module::ModuleRef,
     nan_preserving_float::{F32, F64},
-    value::{
-        ArithmeticOps,
-        ExtendInto,
-        Float,
-        Integer,
-        LittleEndianConvert,
-        TransmuteInto,
-        TryTruncateInto,
-        WrapInto,
+    tracer::{
+        isa::{InstructionDerivationPost, InstructionDerivationPre},
+        Context, ExecutionResult, StepTrace, StepsTrace,
     },
-    RuntimeValue,
-    Signature,
-    Trap,
-    TrapCode,
-    ValueType,
+    value::{
+        ArithmeticOps, ExtendInto, Float, Integer, LittleEndianConvert, TransmuteInto,
+        TryTruncateInto, WrapInto,
+    },
+    RuntimeValue, Signature, Trap, TrapCode, ValueType,
 };
 use alloc::{boxed::Box, vec::Vec};
 use core::{fmt, ops, u32, usize};
@@ -1267,6 +1261,385 @@ impl Interpreter {
     }
 }
 
+impl Interpreter {
+    fn run_instruction_pre(
+        &mut self,
+        instruction: &isa::Instruction,
+    ) -> Option<InstructionDerivationPre<ValueInternal>> {
+        match instruction {
+            isa::Instruction::Br(target) => Some(InstructionDerivationPre::Br {
+                dst_pc: target.dst_pc,
+                keep: target.drop_keep.keep == isa::Keep::Single,
+                drop: target.drop_keep.drop,
+            }),
+            isa::Instruction::BrIfEqz(target) => Some(InstructionDerivationPre::BrIfEqz {
+                cond: <_>::from_value_internal(*self.value_stack.top()),
+                dst_pc: target.dst_pc,
+                keep: target.drop_keep.keep == isa::Keep::Single,
+                drop: target.drop_keep.drop,
+            }),
+            isa::Instruction::BrIfNez(target) => Some(InstructionDerivationPre::BrIfNez {
+                cond: <_>::from_value_internal(*self.value_stack.top()),
+                dst_pc: target.dst_pc,
+                keep: target.drop_keep.keep == isa::Keep::Single,
+                drop: target.drop_keep.drop,
+            }),
+            isa::Instruction::Return(drop_keep) => Some(InstructionDerivationPre::Return {
+                keep: drop_keep.keep == isa::Keep::Single,
+                drop: drop_keep.drop,
+            }),
+
+            isa::Instruction::Select => Some(InstructionDerivationPre::Select {
+                left: *self.value_stack.pick(2),
+                mid: *self.value_stack.pick(1),
+                right: *self.value_stack.pick(0),
+            }),
+
+            isa::Instruction::SetLocal(depth) => Some(InstructionDerivationPre::SetLocal {
+                depth: *depth,
+                value: *self.value_stack.top(),
+            }),
+            isa::Instruction::SetGlobal(index) => Some(InstructionDerivationPre::SetGlobal {
+                index: *index,
+                value: *self.value_stack.top(),
+            }),
+
+            isa::Instruction::I32Store(offset) => self.pre_store::<i32>(*offset),
+
+            isa::Instruction::GrowMemory => {
+                let pages = <_>::from_value_internal(*self.value_stack.top());
+                Some(InstructionDerivationPre::GrowMemory { pages })
+            }
+
+            isa::Instruction::I32Add => Some(InstructionDerivationPre::I32Add {
+                lhs: <_>::from_value_internal(*self.value_stack.pick(1)),
+                rhs: <_>::from_value_internal(*self.value_stack.pick(0)),
+            }),
+            _ => None,
+        }
+    }
+
+    fn run_instruction_post(
+        &mut self,
+        pre: Option<InstructionDerivationPre<ValueInternal>>,
+        context: &mut FunctionContext,
+        instruction: &isa::Instruction,
+    ) -> Option<InstructionDerivationPost<ValueInternal>> {
+        match instruction {
+            isa::Instruction::Unreachable => None,
+
+            isa::Instruction::Br(_) => match pre.unwrap() {
+                InstructionDerivationPre::Br { dst_pc, keep, drop } => {
+                    Some(InstructionDerivationPost::Br {
+                        dst_pc,
+                        keep,
+                        drop,
+                        return_value: if keep {
+                            Some(*self.value_stack.top())
+                        } else {
+                            None
+                        },
+                    })
+                }
+                _ => unreachable!(),
+            },
+            isa::Instruction::BrIfEqz(_) => match pre.unwrap() {
+                InstructionDerivationPre::BrIfEqz {
+                    cond,
+                    dst_pc,
+                    keep,
+                    drop,
+                } => Some(InstructionDerivationPost::BrIfEqz {
+                    cond,
+                    dst_pc,
+                    keep,
+                    drop,
+                    return_value: if keep {
+                        Some(*self.value_stack.top())
+                    } else {
+                        None
+                    },
+                }),
+                _ => unreachable!(),
+            },
+            isa::Instruction::BrIfNez(_) => match pre.unwrap() {
+                InstructionDerivationPre::BrIfNez {
+                    cond,
+                    dst_pc,
+                    keep,
+                    drop,
+                } => Some(InstructionDerivationPost::BrIfNez {
+                    cond,
+                    dst_pc,
+                    keep,
+                    drop,
+                    return_value: if keep {
+                        Some(*self.value_stack.top())
+                    } else {
+                        None
+                    },
+                }),
+                _ => unreachable!(),
+            },
+            isa::Instruction::Return(_) => match pre.unwrap() {
+                InstructionDerivationPre::Return { keep, drop } => {
+                    Some(InstructionDerivationPost::Return {
+                        keep,
+                        drop,
+                        return_value: if keep {
+                            Some(*self.value_stack.top())
+                        } else {
+                            None
+                        },
+                    })
+                }
+                _ => unreachable!(),
+            },
+
+            isa::Instruction::Call(index) => {
+                todo!();
+                Some(InstructionDerivationPost::Call { index: *index })
+            }
+
+            isa::Instruction::Drop => None,
+            isa::Instruction::Select => {
+                let (left, mid, right) = match pre.unwrap() {
+                    InstructionDerivationPre::Select { left, mid, right } => (left, mid, right),
+                    _ => unreachable!(),
+                };
+                Some(InstructionDerivationPost::Select {
+                    left,
+                    mid,
+                    right,
+                    output: *self.value_stack.top(),
+                })
+            }
+
+            isa::Instruction::GetLocal(depth) => Some(InstructionDerivationPost::GetLocal {
+                depth: *depth,
+                value: *self.value_stack.top(),
+            }),
+            isa::Instruction::SetLocal(depth) => {
+                let value = match pre.unwrap() {
+                    InstructionDerivationPre::SetLocal { depth: _, value: v } => v,
+                    _ => unreachable!(),
+                };
+                Some(InstructionDerivationPost::SetLocal {
+                    depth: *depth,
+                    value,
+                })
+            }
+            isa::Instruction::TeeLocal(depth) => Some(InstructionDerivationPost::TeeLocal {
+                depth: *depth,
+                value: *self.value_stack.top(),
+            }),
+            isa::Instruction::GetGlobal(index) => Some(InstructionDerivationPost::GetGlobal {
+                index: *index,
+                value: *self.value_stack.top(),
+            }),
+            isa::Instruction::SetGlobal(_) => match pre.unwrap() {
+                InstructionDerivationPre::SetGlobal { index, value } => {
+                    Some(InstructionDerivationPost::SetGlobal { index, value })
+                }
+                _ => unreachable!(),
+            },
+
+            isa::Instruction::I32Load(offset) => self.post_load::<i32>(*offset),
+            isa::Instruction::I32Store(_) => match pre.unwrap() {
+                InstructionDerivationPre::I32Store {
+                    offset,
+                    raw_address,
+                    value,
+                } => self.post_store::<i32>(offset, raw_address, value),
+                _ => unreachable!(),
+            },
+
+            isa::Instruction::CurrentMemory => Some(InstructionDerivationPost::CurrentMemory(
+                context.memory().unwrap().current_size().0,
+            )),
+            isa::Instruction::GrowMemory => match pre.unwrap() {
+                InstructionDerivationPre::GrowMemory { pages } => {
+                    Some(InstructionDerivationPost::GrowMemory {
+                        pages,
+                        new_size: <_>::from_value_internal(*self.value_stack.top()),
+                    })
+                }
+                _ => unreachable!(),
+            },
+
+            isa::Instruction::I32Const(v) => Some(InstructionDerivationPost::I32Const(*v)),
+
+            isa::Instruction::I32Add => {
+                let (lhs, rhs) = match pre.unwrap() {
+                    InstructionDerivationPre::I32Add { lhs, rhs } => (lhs, rhs),
+                    _ => unreachable!(),
+                };
+                Some(InstructionDerivationPost::I32Add {
+                    lhs,
+                    rhs,
+                    output: <_>::from_value_internal(*self.value_stack.top()),
+                })
+            }
+            _ => todo!(),
+        }
+    }
+
+    fn post_load<T: crate::tracer::isa::Load<ValueInternal>>(
+        &mut self,
+        offset: u32,
+    ) -> Option<InstructionDerivationPost<ValueInternal>> {
+        let value = *self.value_stack.top();
+        let raw_address = <_>::from_value_internal(*self.value_stack.pick(1));
+        Some(T::new_load_post(offset, raw_address, value))
+    }
+
+    fn pre_store<T: crate::tracer::isa::Store<ValueInternal>>(
+        &mut self,
+        offset: u32,
+    ) -> Option<InstructionDerivationPre<ValueInternal>> {
+        let value = *self.value_stack.top();
+        let raw_address = <_>::from_value_internal(*self.value_stack.pick(1));
+        Some(T::new_store_pre(offset, raw_address, value))
+    }
+
+    fn post_store<T: crate::tracer::isa::Store<ValueInternal>>(
+        &mut self,
+        offset: u32,
+        raw_address: u32,
+        value: ValueInternal,
+    ) -> Option<InstructionDerivationPost<ValueInternal>> {
+        Some(T::new_store_post(offset, raw_address, value))
+    }
+
+    fn run_interpreter_loop_trace<'a, E: Externals + 'a>(
+        &mut self,
+        tracer: &mut StepsTrace,
+        externals: &'a mut E,
+    ) -> Result<(), Trap> {
+        loop {
+            let mut function_context = self.call_stack.pop().expect(
+                "on loop entry - not empty; on loop continue - checking for emptiness; qed",
+            );
+            let function_ref = function_context.function.clone();
+            let function_body = function_ref
+				.body()
+				.expect(
+					"Host functions checked in function_return below; Internal functions always have a body; qed"
+				);
+
+            if !function_context.is_initialized() {
+                // Initialize stack frame for the function call.
+                function_context.initialize(&function_body.locals, &mut self.value_stack)?;
+            }
+
+            let function_return = self
+                .do_run_function_trace(tracer, &mut function_context, &function_body.code)
+                .map_err(Trap::from)?;
+
+            match function_return {
+                RunResult::Return => {
+                    if self.call_stack.is_empty() {
+                        // This was the last frame in the call stack. This means we
+                        // are done executing.
+                        return Ok(());
+                    }
+                }
+                RunResult::NestedCall(nested_func) => {
+                    if self.call_stack.is_full() {
+                        return Err(TrapCode::StackOverflow.into());
+                    }
+
+                    match *nested_func.as_internal() {
+                        FuncInstanceInternal::Internal { .. } => {
+                            let nested_context = FunctionContext::new(nested_func.clone());
+                            self.call_stack.push(function_context);
+                            self.call_stack.push(nested_context);
+                        }
+                        FuncInstanceInternal::Host { .. } => {
+                            unreachable!();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn do_run_function_trace(
+        &mut self,
+        tracer: &mut StepsTrace,
+        function_context: &mut FunctionContext,
+        instructions: &isa::Instructions,
+    ) -> Result<RunResult, TrapCode> {
+        let mut iter = instructions.iterate_from(function_context.position);
+
+        loop {
+            let instruction = iter.next().expect(
+                "Ran out of instructions, this should be impossible \
+                 since validation ensures that we either have an explicit \
+                 return or an implicit block `end`.",
+            );
+
+            let before = Context::current_context(self, function_context, iter.position());
+            let pre_derivation = self.run_instruction_pre(&instruction);
+
+            let outcome = self
+                .run_instruction(function_context, &instruction)
+                .map_err(|trap| {
+                    self.run_instruction_post(pre_derivation, function_context, &instruction);
+                    let after = Context::current_context(self, function_context, iter.position());
+
+                    tracer.push(StepTrace::new(
+                        before,
+                        after,
+                        ExecutionResult::from(&Err(trap)),
+                    ));
+
+                    trap
+                })?;
+
+            match outcome {
+                InstructionOutcome::RunNextInstruction => {}
+                InstructionOutcome::Branch(target) => {
+                    iter = instructions.iterate_from(target.dst_pc);
+                    self.value_stack.drop_keep(target.drop_keep);
+                }
+                InstructionOutcome::ExecuteCall(func_ref) => {
+                    function_context.position = iter.position();
+                    return Ok(RunResult::NestedCall(func_ref));
+                }
+                InstructionOutcome::Return(drop_keep) => {
+                    self.value_stack.drop_keep(drop_keep);
+                    break;
+                }
+            }
+
+            self.run_instruction_post(pre_derivation, function_context, &instruction);
+            let after = Context::current_context(self, function_context, iter.position());
+
+            tracer.push(StepTrace::new(
+                before,
+                after,
+                ExecutionResult::from(&Ok(outcome)),
+            ));
+        }
+
+        Ok(RunResult::Return)
+    }
+}
+
+impl crate::tracer::Context {
+    fn current_context(intp: &Interpreter, function_context: &FunctionContext, pc: u32) -> Self {
+        crate::tracer::Context {
+            memory_size: {
+                let m = function_context
+                    .memory()
+                    .expect("Due to validation memory should exists");
+                m.current_size().0
+            },
+            sp: intp.value_stack.sp,
+        }
+    }
+}
 /// Function execution context.
 struct FunctionContext {
     /// Is context initialized.

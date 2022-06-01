@@ -269,6 +269,8 @@ mod prepare;
 mod runner;
 mod table;
 mod types;
+#[macro_use]
+mod tracer;
 
 pub use self::{
     func::{FuncInstance, FuncInvocation, FuncRef, ResumableError},
